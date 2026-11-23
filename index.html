@@ -67,6 +67,7 @@ body.drive #map{visibility:hidden}
 <div id="status" class="hud m-only">載入中…</div>
 <div id="tools" class="hud m-only">
   <button class="tb" id="bLoc" title="定位到我的位置">📍</button>
+  <button class="tb" id="bMode" title="切換：生成城鎮／真實道路">🌍</button>
   <button class="tb" id="bBase" title="切換底圖">🗺</button>
   <button class="tb" id="bInv" title="背包">🎒</button>
 </div>
@@ -93,7 +94,7 @@ body.drive #map{visibility:hidden}
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 'use strict';
-const VER = 'v002';
+const VER = 'v003';
 
 // #CORE-BEGIN 純函式：座標、路網、導航、軌道（可在 Node 測試）
 const R = 6378137, HALF = Math.PI * R, KS = Math.cos(23.7 * Math.PI / 180);   // 墨卡托×cos(台灣中緯) ≈ 地面公尺
@@ -323,6 +324,48 @@ function posAt(T, s) {
   return { x: T.X[i] + (T.X[i + 1] - T.X[i]) * t, y: T.Y[i] + (T.Y[i + 1] - T.Y[i]) * t, h: h0 + wrap(h1 - h0) * t, w: T.W[i] + (T.W[i + 1] - T.W[i]) * t, i };
 }
 const curvAt = (T, s) => { const i = Math.round(s / STEP); return wrap(headIdx(T, i + 3) - headIdx(T, i - 3)) / (6 * STEP); };
+// 生成城鎮（Overpass 同格式）：9×9 不規則格網、彎路、斷巷、死巷、25 個地點；同一位置同一座城
+function genTown(cx, cy, seed) {
+  const r = rng(seed), els = []; let nid = -1, wid = -1;
+  const N = 9, H = N >> 1, gx = [0], gy = [0];
+  for (let i = 1; i < N; i++) { gx.push(gx[i - 1] + 110 + r() * 90); gy.push(gy[i - 1] + 110 + r() * 90); }
+  const P = [];
+  for (let i = 0; i < N; i++) { P.push([]); for (let j = 0; j < N; j++) P[i].push({ id: nid--, x: cx - gx[H] + gx[i] + (r() - .5) * 30, y: cy - gy[H] + gy[j] + (r() - .5) * 30 }); }
+  const ll = p => { const l = toLL(p.x, p.y); return { lat: l.lat, lon: l.lng }; };
+  const way = (pts, hw, name) => { if (pts.length > 1) els.push({ type: 'way', id: wid--, nodes: pts.map(p => p.id), geometry: pts.map(ll), tags: { highway: hw, name } }); };
+  const RN = ['民生路', '中山路', '復興路', '和平街', '光明街', '忠孝路', '仁愛街', '信義街', '自強街', '文化路', '成功路', '大同街', '公園路', '建國路', '博愛街', '育英街'];
+  const segs = [], names = [];
+  for (let dir = 0; dir < 2; dir++) for (let j = 0; j < N; j++) {
+    const main = j === H, name = main ? (dir ? '中華路' : '中正路') : RN[(j + dir * 8) % RN.length], hw = main ? (dir ? 'secondary' : 'primary') : j % 3 === 0 ? 'tertiary' : 'residential';
+    let cur = [];
+    for (let i = 0; i < N; i++) {
+      const a = dir ? P[j][i] : P[i][j]; cur.push(a);
+      if (i === N - 1) break;
+      const b = dir ? P[j][i + 1] : P[i + 1][j];
+      if (!main && hw === 'residential' && r() < 0.12) { way(cur, hw, name); cur = []; continue; }   // 斷巷
+      segs.push([a, b, name]);
+      if (r() < 0.35) { const dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy), o = (r() - .5) * 40; cur.push({ id: nid--, x: (a.x + b.x) / 2 - dy / L * o, y: (a.y + b.y) / 2 + dx / L * o }); }
+    }
+    way(cur, hw, name);
+  }
+  for (let k = 0; k < 10; k++) {   // 死巷
+    const a = P[1 + Math.floor(r() * (N - 2))][1 + Math.floor(r() * (N - 2))], ang = r() * Math.PI * 2, L = 40 + r() * 30;
+    way([a, { id: nid--, x: a.x + Math.cos(ang) * L, y: a.y + Math.sin(ang) * L }], 'service', '');
+  }
+  const BAG = ['convenience', 'convenience', 'convenience', 'convenience', 'convenience', 'convenience', 'convenience', 'convenience', 'pharmacy', 'pharmacy', 'pharmacy',
+    'clinic', 'clinic', 'hospital', 'fuel', 'fuel', 'fuel', 'school', 'school', 'police', 'fire_station', 'supermarket', 'supermarket', 'hardware', 'hardware'];
+  const pick = a => a[Math.floor(r() * a.length)];
+  BAG.forEach((ty, k) => {
+    const [a, b, st] = pick(segs), t = .25 + r() * .5, dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy), sd = r() < .5 ? 1 : -1;
+    const p = { x: a.x + dx * t + dy / L * 14 * sd, y: a.y + dy * t - dx / L * 14 * sd }, s2 = st.slice(0, 2);
+    const nm = { convenience: pick(['7-ELEVEN ', '全家 ', '萊爾富 ', 'OK超商 ']) + s2 + '門市', supermarket: '全聯 ' + s2 + '店', hardware: s2 + '五金行',
+      pharmacy: pick(['大樹藥局 ', '杏一藥局 ', '丁丁藥局 ']) + s2 + '店', clinic: s2 + pick(['家醫科診所', '耳鼻喉科診所', '小兒科診所']), hospital: s2 + '綜合醫院',
+      fuel: pick(['中油 ', '台塑石油 ']) + s2 + '站', school: s2 + pick(['國小', '國中']), police: s2 + '派出所', fire_station: s2 + '消防分隊' }[ty];
+    const tags = { name: nm }; tags[ty === 'convenience' || ty === 'supermarket' || ty === 'hardware' ? 'shop' : 'amenity'] = ty;
+    const q = ll(p); els.push({ type: 'node', id: -100000 - k, lat: q.lat, lon: q.lon, tags });
+  });
+  return { elements: els };
+}
 // #CORE-END
 
 // ───────── 設定與狀態
@@ -333,33 +376,58 @@ const QUERY = (lat, lng, r) => `[out:json][timeout:40];(way["highway"~"^(${Objec
 const START = { lat: 24.1372, lng: 120.6866 };   // 台中車站
 const VMAX = 70 / 3.6, ACC = 3.2, BRK = 9, DRAG = 0.6, CAMH = 1.35, FOV = 95 * Math.PI / 180, NEAR = 0.4, DRAW = 220, RESTOCK = 6 * 3600e3;
 
-const DATA = makeData();
-let G = null, NAV = null, DR = null;
+const WORLDS = { gen: makeData(), real: makeData() };
+let G = null, NAV = null, DR = null, MODE = 'gen', DATA = WORLDS.gen, realState = '';
 const PL = { x: 0, y: 0 };
 let SAVE = { inv: {}, looted: {} };
 try { const s = JSON.parse(localStorage.getItem('gq2') || 'null'); if (s) { SAVE = Object.assign(SAVE, s); if (s.lat) Object.assign(PL, toM(s.lat, s.lng)); } } catch (e) {}
 const hadPos = !!PL.x;
+if (SAVE.mode === 'real') { MODE = 'real'; DATA = WORLDS.real; }
 if (!hadPos) Object.assign(PL, toM(START.lat, START.lng));
-function save() { try { const ll = toLL(PL.x, PL.y); SAVE.lat = ll.lat; SAVE.lng = ll.lng; localStorage.setItem('gq2', JSON.stringify(SAVE)); } catch (e) {} }
+function save() { try { const ll = toLL(PL.x, PL.y); SAVE.mode = MODE; SAVE.lat = ll.lat; SAVE.lng = ll.lng; localStorage.setItem('gq2', JSON.stringify(SAVE)); } catch (e) {} }
 
 const $ = id => document.getElementById(id);
 const status = t => { $('status').textContent = t; };
+function updStatus() {
+  const head = MODE === 'gen' ? '🎲 生成城鎮（離線可玩）' : '🌍 真實道路';
+  const cnt = G ? `道路 ${G.edges.size} 段｜地點 ${DATA.pois.size}` : '沒有道路資料';
+  const real = MODE === 'gen' ? (realState === 'ok' ? '\n真實道路已就緒，按 🌍 切換' : realState ? '\n真實道路：' + realState : '')
+    : (realState && realState !== 'ok' ? '\n' + realState + '\n可按 🌍 改玩生成城鎮' : '');
+  status(`${head}\n${cnt}\n點地點設目的地 → 🛵 出發${real}`);
+}
 $('ver').textContent = 'GQ 冒險 · ' + VER;
 
 // ───────── 地圖模式
 const map = L.map('map', { zoomControl: false, minZoom: 8, maxZoom: 20, maxBounds: [[20.5, 117.5], [27, 123]] });
 const nlsc = id => L.tileLayer('https://wmts.nlsc.gov.tw/wmts/' + id + '/default/GoogleMapsCompatible/{z}/{y}/{x}',
   { maxZoom: 20, maxNativeZoom: 19, attribution: '底圖 © 內政部國土測繪中心｜道路 © OpenStreetMap' });
-const BASES = [nlsc('EMAP'), nlsc('PHOTO2')]; let baseI = 0; BASES[0].addTo(map);
+const BASES = [nlsc('EMAP'), nlsc('PHOTO2')]; let baseI = 0;
+const genLayer = L.layerGroup();
 const llOf = () => { const l = toLL(PL.x, PL.y); return [l.lat, l.lng]; };
 map.setView(llOf(), 17);
 const meMarker = L.marker(llOf(), { icon: L.divIcon({ className: 'me', html: '🛵', iconSize: [30, 30] }), zIndexOffset: 1000 }).addTo(map);
 const poiLayer = L.layerGroup().addTo(map);
 let routeLine = null;
+const RC = { primary: ['#f5c542', 9], secondary: ['#f0e0a0', 7], tertiary: ['#ffffff', 6], residential: ['#dddddd', 4], service: ['#bbbbbb', 3] };
+function drawGenRoads() {
+  genLayer.clearLayers();
+  for (const w of WORLDS.gen.ways.values()) { const c = RC[w.cls] || RC.residential;
+    L.polyline(w.geom.map(p => { const l = toLL(p.x, p.y); return [l.lat, l.lng]; }), { color: c[0], weight: c[1], opacity: .9, interactive: false }).addTo(genLayer); }
+}
+function applyModeLayers() {
+  if (MODE === 'gen') { map.removeLayer(BASES[baseI]); genLayer.addTo(map); $('map').style.background = '#3d4a3a'; drawGenRoads(); }
+  else { map.removeLayer(genLayer); BASES[baseI].addTo(map); $('map').style.background = '#222'; }
+}
+function switchMode(m) {
+  MODE = m; DATA = WORLDS[m]; NAV = null; DR = null; applyModeLayers();
+  if (m === 'gen') genArea(PL.x, PL.y);
+  rebuildGraph(); if (m === 'real') ensureArea(PL.x, PL.y);
+  save(); updStatus();
+}
 
-function setPL(x, y, pan) { PL.x = x; PL.y = y; meMarker.setLatLng(llOf()); if (pan) map.setView(llOf(), Math.max(map.getZoom(), 16)); ensureArea(x, y); drawRoute(); save(); }
+function setPL(x, y, pan) { PL.x = x; PL.y = y; meMarker.setLatLng(llOf()); if (pan) map.setView(llOf(), Math.max(map.getZoom(), 16)); if (MODE === 'gen') genArea(x, y); ensureArea(x, y); drawRoute(); save(); }
 function drawPois() {
-  poiLayer.clearLayers();
+  poiLayer.clearLayers(); if (!G) return;
   for (const p of DATA.pois.values()) {
     const cls = 'poi' + (p.edge ? '' : ' far') + (NAV && NAV.poi === p ? ' dest' : '');
     L.marker([p.lat, p.lng], { icon: L.divIcon({ className: cls, html: PT[p.type][0], iconSize: [26, 26] }) }).on('click', () => openPoi(p)).addTo(poiLayer);
@@ -401,7 +469,8 @@ $('bLoc').onclick = () => {
   navigator.geolocation.getCurrentPosition(p => { const m = toM(p.coords.latitude, p.coords.longitude); setPL(m.x, m.y, true); },
     err => status('定位失敗：' + err.message), { enableHighAccuracy: true, timeout: 10000 });
 };
-$('bBase').onclick = () => { map.removeLayer(BASES[baseI]); baseI = (baseI + 1) % BASES.length; BASES[baseI].addTo(map); };
+$('bBase').onclick = () => { if (MODE === 'gen') return; map.removeLayer(BASES[baseI]); baseI = (baseI + 1) % BASES.length; BASES[baseI].addTo(map); };
+$('bMode').onclick = () => switchMode(MODE === 'gen' ? 'real' : 'gen');
 $('bInv').onclick = () => {
   const el = $('inv'); if (el.style.display === 'block') { el.style.display = 'none'; return; }
   const items = Object.entries(SAVE.inv).filter(x => x[1] > 0);
@@ -421,7 +490,7 @@ async function fetchArea(key) {
   let err = new Error('無可用伺服器');
   for (const u of OVERPASS) {
     try {
-      const ac = new AbortController(), to = setTimeout(() => ac.abort(), 40000);
+      const ac = new AbortController(), to = setTimeout(() => ac.abort(), 15000);
       const r = await fetch(u, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ac.signal });
       clearTimeout(to);
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -434,12 +503,20 @@ async function fetchArea(key) {
 }
 async function ensureArea(x, y) {
   const key = cellKey(x, y); if (loaded.has(key) || loadingArea) return;
-  loadingArea = true; status('載入道路與地點…（第一次約 5–30 秒）');
-  try { ingest(DATA, await fetchArea(key)); loaded.add(key); rebuildGraph(); status(`道路 ${G.edges.size} 段｜地點 ${DATA.pois.size}\n點地點設目的地；長按地圖可移動起點`); }
-  catch (e) { status('資料載入失敗：' + e.message + '\n8 秒後重試'); setTimeout(() => ensureArea(PL.x, PL.y), 8000); }
-  finally { loadingArea = false; }
+  loadingArea = true; realState = '載入中…'; updStatus();
+  try { ingest(WORLDS.real, await fetchArea(key)); loaded.add(key); realState = 'ok'; if (MODE === 'real') rebuildGraph(); }
+  catch (e) { realState = '載入失敗（' + (e.name === 'AbortError' ? '逾時' : e.message) + '），30 秒後重試'; setTimeout(() => ensureArea(PL.x, PL.y), 30000); }
+  finally { loadingArea = false; updStatus(); }
+}
+const genDone = new Set();
+function genArea(x, y) {
+  const key = cellKey(x, y); if (genDone.has(key)) return; genDone.add(key);
+  const [lat, lng] = key.split(',').map(Number), c = toM(lat, lng);
+  ingest(WORLDS.gen, genTown(c.x, c.y, hash(key)));
+  if (MODE === 'gen') { drawGenRoads(); rebuildGraph(); }
 }
 function rebuildGraph() {
+  if (!DATA.ways.size) { G = null; drawPois(); return; }
   G = buildGraph(DATA); projectPois(G, DATA);
   if (NAV) NAV = makeNav(G, NAV.poi);
   if (DR) {   // 行駛中合併新資料：保住目前位置
@@ -448,7 +525,7 @@ function rebuildGraph() {
     if (G.edges.has(DR.cur.e)) rebuild(off);
     else { const p = posAt(DR.T, DR.s), r = nearestEdge(G, p.x, p.y, 60); if (r) { const f = Math.cos(wrap(r.h - p.h)) >= 0; DR.cur = { e: r.e, f }; DR.hist = []; DR.choice = null; rebuild(f ? r.t : G.edges.get(r.e).len - r.t); } }
   }
-  drawPois(); drawRoute(); goLabel();
+  drawPois(); drawRoute(); goLabel(); updStatus();
 }
 
 // ───────── 行駛模式
@@ -475,7 +552,7 @@ const curOff = () => DR.s - DR.T.starts[DR.T.curIdx];
 const curEnd = () => DR.T.curIdx + 1 < DR.T.seq.length ? DR.T.starts[DR.T.curIdx + 1] : DR.T.total;
 
 function enterDrive() {
-  if (!G) return status('道路資料還沒載入');
+  if (!G) { if (MODE === 'real') switchMode('gen'); if (!G) return; }
   const r = nearestEdge(G, PL.x, PL.y, 250); if (!r) return status('附近 250m 內沒有道路資料');
   const f = dirToward(r), e = G.edges.get(r.e);
   DR = { hist: [], cur: { e: r.e, f }, choice: null, s: 0, v: 0, lat: e.hw * 0.45, steer: 0, odo: 0, T: null, exits: [], hudKey: '', arrived: false };
@@ -488,7 +565,7 @@ function exitDrive() {
   if (DR) { const p = posAt(DR.T, DR.s); PL.x = p.x; PL.y = p.y; }
   running = false; held.clear(); keys.clear();
   document.body.classList.remove('drive'); $('enter').style.display = 'none'; $('loot').style.display = 'none';
-  resize(); meMarker.setLatLng(llOf()); map.setView(llOf(), Math.max(map.getZoom(), 16)); drawRoute(); save();
+  DR = null; resize(); meMarker.setLatLng(llOf()); map.setView(llOf(), Math.max(map.getZoom(), 16)); drawRoute(); save();
 }
 function uturn() {
   if (!DR || DR.v > 1.5) return;
@@ -740,17 +817,16 @@ function loop(t) {
   const dt = Math.min(0.05, Math.max(0, (t - lastT) / 1000)); lastT = t;
   driveStep(dt); renderDrive(); updateHud(t);
   if (++frameN % 3 === 0) drawMini();
-  if (t - chkT > 1000) { chkT = t; ensureArea(PL.x, PL.y); save(); }
+  if (t - chkT > 1000) { chkT = t; if (MODE === 'real') ensureArea(PL.x, PL.y); else genArea(PL.x, PL.y); save(); }
   requestAnimationFrame(loop);
 }
 
 // 啟動：沒有存檔位置就先問 GPS
-resize();
-if (!hadPos && navigator.geolocation) {
-  status('取得定位中…（拒絕則從台中車站開始）');
-  navigator.geolocation.getCurrentPosition(p => { const m = toM(p.coords.latitude, p.coords.longitude); setPL(m.x, m.y, true); },
-    () => ensureArea(PL.x, PL.y), { enableHighAccuracy: true, timeout: 8000 });
-} else ensureArea(PL.x, PL.y);
+resize(); applyModeLayers();
+if (MODE === 'gen') genArea(PL.x, PL.y);      // 先讓生成城鎮立刻可玩，真實道路背景載入
+ensureArea(PL.x, PL.y); updStatus();
+if (!hadPos && navigator.geolocation)
+  navigator.geolocation.getCurrentPosition(p => { const m = toM(p.coords.latitude, p.coords.longitude); setPL(m.x, m.y, true); }, () => {}, { enableHighAccuracy: true, timeout: 8000 });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
